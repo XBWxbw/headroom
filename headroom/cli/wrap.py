@@ -2506,6 +2506,299 @@ def unwrap_claude(
 
 
 # =============================================================================
+# Claude Code Internal (Tencent build)
+# =============================================================================
+
+
+@wrap.command("claude-internal", context_settings={"ignore_unknown_options": True})
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--no-context-tool",
+    "--no-rtk",
+    "no_rtk",
+    is_flag=True,
+    help="Skip CLI context-tool setup",
+)
+@click.option(
+    "--no-mcp",
+    is_flag=True,
+    help="Skip headroom MCP server registration (compression markers will be unactionable)",
+)
+@click.option("--no-serena", is_flag=True, help="Skip Serena MCP server registration")
+@click.option(
+    "--code-graph",
+    is_flag=True,
+    help="Enable code graph indexing via codebase-memory-mcp (optional)",
+)
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option(
+    "--learn", is_flag=True, help="Enable live traffic learning (patterns saved to MEMORY.md)"
+)
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--tool-search",
+    "tool_search",
+    default=None,
+    metavar="MODE",
+    help=(
+        "Keep Claude Code's on-demand tool loading (deferral) active through the "
+        "proxy. MODE is true (default), auto, auto:N, or false. Without it, a "
+        "custom ANTHROPIC_BASE_URL makes Claude Code load every tool schema "
+        "eagerly, inflating local context (issue #746). A pre-set "
+        "ENABLE_TOOL_SEARCH env var is respected."
+    ),
+)
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
+def claude_internal(
+    port: int,
+    no_rtk: bool,
+    no_mcp: bool,
+    no_serena: bool,
+    code_graph: bool,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    tool_search: str | None,
+    verbose: bool,
+    prepare_only: bool,
+    claude_args: tuple,
+) -> None:
+    """Launch Claude Code Internal (Tencent build) through Headroom proxy.
+
+    \\b
+    Sets ANTHROPIC_BASE_URL to route all Anthropic API calls through Headroom.
+    All unknown flags are passed through to claude-internal (e.g. --resume, --model).
+
+    \\b
+    Examples:
+        headroom wrap claude-internal                    # Start everything
+        headroom wrap claude-internal --memory           # With persistent memory
+        headroom wrap claude-internal --resume <id>      # Resume a session
+        headroom wrap claude-internal -- -p              # Print mode
+        headroom wrap claude-internal --code-graph        # With code graph intelligence
+        headroom wrap claude-internal --no-context-tool  # Skip CLI context-tool setup
+        headroom wrap claude-internal --no-mcp           # Skip MCP retrieve tool registration
+        headroom wrap claude-internal --no-serena        # Skip Serena MCP registration
+    """
+    if prepare_only:
+        if not no_rtk:
+            if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+                _setup_lean_ctx_agent("claude", verbose=verbose)
+            else:
+                _prepare_wrap_rtk(verbose=verbose, label="Claude Internal")
+        return
+
+    claude_bin = shutil.which("claude-internal")
+    if not claude_bin:
+        click.echo("Error: 'claude-internal' not found in PATH.")
+        click.echo("Install Claude Code Internal: npm install -g @tencent/claude-code-internal")
+        raise SystemExit(1)
+
+    # Validate --tool-search up front so a typo fails before we start the proxy.
+    if tool_search is not None:
+        tool_search = _normalize_tool_search_mode(tool_search)
+
+    # Setup rtk before launching
+    proxy_holder: list[subprocess.Popen | None] = [None]
+    cleanup = _make_cleanup(proxy_holder, port)
+    signal.signal(signal.SIGINT, _ignore_child_sigint)
+    signal.signal(signal.SIGTERM, cleanup)
+
+    # Memory sync BEFORE proxy startup — sync headroom DB ↔ Claude's files
+    if memory:
+        try:
+            import subprocess as _sp
+
+            mem_dir = Path.cwd() / ".headroom"
+            mem_dir.mkdir(parents=True, exist_ok=True)
+            _sync_db = str(mem_dir / "memory.db")
+            _sync_user = os.environ.get("USER", os.environ.get("USERNAME", "default"))
+
+            click.echo(f"  Syncing memory (user={_sync_user})...")
+            sync_result = _sp.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "headroom.memory.sync",
+                    "--db",
+                    _sync_db,
+                    "--user",
+                    _sync_user,
+                    "--agent",
+                    "claude",
+                    "--force",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if sync_result.returncode == 0 and sync_result.stdout.strip():
+                import json as _json
+
+                stats = _json.loads(sync_result.stdout.strip().split("\n")[-1])
+                imp, exp, ms = stats["imported"], stats["exported"], stats["ms"]
+                if imp or exp:
+                    click.echo(f"  Memory synced: {imp} imported, {exp} exported ({ms}ms)")
+                else:
+                    click.echo(f"  Memory: up to date ({ms}ms)")
+            elif sync_result.returncode != 0:
+                click.echo(f"  Warning: memory sync error: {sync_result.stderr[-200:]}")
+        except Exception as e:
+            click.echo(f"  Warning: memory sync failed: {e}")
+
+    try:
+        click.echo()
+        click.echo("  ╔═══════════════════════════════════════════════╗")
+        click.echo("  ║       HEADROOM WRAP: CLAUDE-INTERNAL          ║")
+        click.echo("  ╚═══════════════════════════════════════════════╝")
+        click.echo()
+
+        # Detect Foundry mode
+        foundry_upstream = None
+        if os.environ.get("CLAUDE_CODE_USE_FOUNDRY"):
+            foundry_upstream = os.environ.get("ANTHROPIC_FOUNDRY_BASE_URL")
+
+        proxy_holder[0] = _ensure_proxy(
+            port,
+            no_proxy,
+            learn=learn,
+            memory=memory,
+            agent_type="claude-internal",
+            code_graph=code_graph,
+            anthropic_api_url=foundry_upstream,
+        )
+
+        if not no_rtk:
+            if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+                click.echo("  Setting up lean-ctx...")
+                _setup_lean_ctx_agent("claude", verbose=verbose)
+            else:
+                click.echo("  Setting up rtk...")
+                _setup_rtk(verbose=verbose)
+        elif verbose:
+            click.echo("  Skipping CLI context tool (--no-context-tool)")
+
+        if not no_mcp:
+            from headroom.mcp_registry import ClaudeRegistrar
+
+            _setup_headroom_mcp(ClaudeRegistrar(), port, verbose=verbose)
+        elif verbose:
+            click.echo("  Skipping MCP retrieve tool (--no-mcp)")
+
+        if not no_serena:
+            from headroom.mcp_registry import ClaudeRegistrar
+
+            _setup_serena_mcp(ClaudeRegistrar(), context="claude-code", verbose=verbose)
+        elif verbose:
+            click.echo("  Skipping Serena MCP (--no-serena)")
+
+        if code_graph:
+            _setup_code_graph(verbose=verbose)
+
+        proxy_url = _claude_proxy_base_url(port)
+        click.echo()
+        click.echo("  Launching Claude Code Internal (API routed through Headroom)...")
+        if foundry_upstream:
+            click.echo(
+                f"  Foundry mode: ANTHROPIC_FOUNDRY_BASE_URL={proxy_url} → upstream {foundry_upstream}"
+            )
+        else:
+            click.echo(f"  ANTHROPIC_BASE_URL={proxy_url}")
+        if claude_args:
+            click.echo(f"  Extra args: {' '.join(claude_args)}")
+        _print_telemetry_notice()
+        click.echo()
+
+        env = os.environ.copy()
+        if foundry_upstream:
+            env["ANTHROPIC_FOUNDRY_BASE_URL"] = proxy_url
+        else:
+            env["ANTHROPIC_BASE_URL"] = proxy_url
+
+        # Issue #746: keep Claude Code's on-demand tool loading on through the proxy
+        _tool_search_value = _configure_tool_search_env(env, tool_search)
+        if _tool_search_value is not None:
+            click.echo(
+                f"  {_TOOL_SEARCH_ENV}={_tool_search_value} "
+                "(on-demand tool loading kept on; issue #746)"
+            )
+        elif verbose:
+            click.echo(
+                f"  {_TOOL_SEARCH_ENV}={env.get(_TOOL_SEARCH_ENV)} "
+                "(using your existing environment value)"
+            )
+
+        result = subprocess.run([claude_bin, *claude_args], env=env)
+        raise SystemExit(result.returncode)
+
+    except SystemExit:
+        raise
+    except Exception as e:
+        click.echo(f"  Error: {e}")
+        raise SystemExit(1) from e
+    finally:
+        cleanup()
+
+
+@unwrap.command("claude-internal")
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
+@click.option("--keep-mcp", is_flag=True, help="Keep Headroom MCP registrations")
+@click.option("--keep-rtk", is_flag=True, help="Keep rtk Claude hooks")
+def unwrap_claude_internal(
+    port: int,
+    no_stop_proxy: bool,
+    keep_mcp: bool,
+    keep_rtk: bool,
+) -> None:
+    """Undo durable setup from ``headroom wrap claude-internal``."""
+    click.echo()
+    click.echo("  ╔═══════════════════════════════════════════════╗")
+    click.echo("  ║      HEADROOM UNWRAP: CLAUDE-INTERNAL         ║")
+    click.echo("  ╚═══════════════════════════════════════════════╝")
+    click.echo()
+
+    if not keep_mcp:
+        from headroom.mcp_registry import ClaudeRegistrar
+
+        registrar = ClaudeRegistrar()
+        if registrar.detect():
+            removed_headroom = registrar.unregister_server("headroom")
+            removed_code_graph = registrar.unregister_server(_CBM_MCP_SERVER_NAME)
+            serena_status = _remove_headroom_installed_serena_mcp(registrar)
+            if removed_headroom:
+                click.echo("  Removed Headroom MCP retrieve tool from Claude.")
+            else:
+                click.echo("  Headroom MCP retrieve tool was not registered in Claude.")
+            if removed_code_graph:
+                click.echo("  Removed code graph MCP server from Claude.")
+            if serena_status == "removed":
+                click.echo("  Removed Headroom-installed Serena MCP server from Claude.")
+            elif serena_status == "failed":
+                click.echo("  Serena MCP server matched Headroom ledger but could not be removed.")
+        else:
+            click.echo("  Claude Code not detected; skipped MCP cleanup.")
+    else:
+        click.echo("  Kept Claude MCP registrations (--keep-mcp).")
+
+    if not keep_rtk:
+        if _remove_claude_rtk_hooks():
+            click.echo("  Removed rtk Claude hook from settings.json.")
+        else:
+            click.echo("  No rtk Claude hook found in settings.json.")
+    else:
+        click.echo("  Kept rtk Claude hooks (--keep-rtk).")
+
+    click.echo()
+    click.echo("✓ Claude Internal is no longer durably wrapped by Headroom.")
+    if not no_stop_proxy:
+        _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
+    click.echo()
+
+
+# =============================================================================
 # GitHub Copilot CLI
 # =============================================================================
 
